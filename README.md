@@ -1,4 +1,4 @@
-
+Got the business prop. Here's the updated README with the business impact woven in — hackathon-winner style:
 
 ---
 
