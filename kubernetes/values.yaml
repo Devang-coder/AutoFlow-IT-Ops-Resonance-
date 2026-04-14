@@ -1,0 +1,60 @@
+serverFiles:
+  alerting_rules.yml:
+    groups:
+    - name: autoflow-alerts
+      rules:
+      - alert: PodNotScheduled
+        expr: kube_pod_status_scheduled{condition="false"} == 1
+        for: 30s
+        labels:
+          severity: warning
+          layer: infrastructure
+        annotations:
+          summary: "Pod cannot be scheduled"
+          value: "{{ $value }}"
+
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"}) < 0.10
+        for: 1m
+        labels:
+          severity: warning
+          layer: infrastructure
+        annotations:
+          summary: "Low disk space"
+          value: "{{ $value }}"
+
+      - alert: CriticalDiskSpace
+        expr: (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"}) < 0.05
+        for: 1m
+        labels:
+          severity: critical
+          layer: infrastructure
+        annotations:
+          summary: "Critical disk space"
+          value: "{{ $value }}"
+
+      - alert: HighCPUUsage
+        expr: rate(container_cpu_usage_seconds_total[1m]) > 0.5
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          value: "{{ $value }}"
+
+alertmanager:
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ["alertname", "namespace"]
+      group_wait: 5s
+      group_interval: 30s
+      repeat_interval: 1m
+      receiver: n8n-telemetry
+    receivers:
+    - name: n8n-telemetry
+      webhook_configs:
+      - url: "http://host.minikube.internal:5678/webhook/autoflow/telemetry"
+        send_resolved: true

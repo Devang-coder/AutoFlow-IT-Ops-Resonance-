@@ -1,0 +1,1282 @@
+# =============================================================================
+# our-system.yaml
+# Plug-and-play Kubernetes Monitoring Stack
+# =============================================================================
+#
+# ARCHITECTURE:
+#   Existing cluster
+#       ↓
+#   our-system (installed via: kubectl apply -f our-system.yaml)
+#       ↓
+#   Monitoring + Detection + Alerting
+#
+# WHAT IS DEPLOYED:
+#   - Namespace: monitoring
+#   - Prometheus Server          (scrapes all container + node metrics)
+#   - Node Exporter              (DaemonSet: host-level metrics per node)
+#   - Kube-State-Metrics         (Deployment: K8s object-level metrics)
+#   - Alertmanager               (StatefulSet: receives + routes alerts)
+#   - Alert Rules ConfigMap      (HighCPUUsage: rate()[5m], for: 20s)
+#   - RBAC                       (ClusterRole/Binding for Prometheus)
+#
+# DEPLOY:
+#   kubectl apply -f our-system.yaml
+#
+# VERIFY:
+#   kubectl get pods -n monitoring
+#   kubectl port-forward svc/our-prometheus -n monitoring 9090:9090
+#   # open http://localhost:9090 → Status → Targets / Alerts
+#
+# TEARDOWN (does NOT touch existing cluster components):
+#   kubectl delete namespace monitoring
+#
+# =============================================================================
+
+---
+# =============================================================================
+# 1. NAMESPACE
+#    All our components live in a dedicated namespace so they are
+#    isolated from – and do not interfere with – any existing install.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/managed-by: our-system
+    app.kubernetes.io/part-of: our-monitoring-stack
+
+---
+# =============================================================================
+# 2. SERVICE ACCOUNTS
+#    Each component gets its own ServiceAccount to allow fine-grained RBAC.
+# =============================================================================
+
+# --- Prometheus ServiceAccount ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: our-prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+
+---
+# --- Node Exporter ServiceAccount ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: our-node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-node-exporter
+    app.kubernetes.io/part-of: our-monitoring-stack
+automountServiceAccountToken: false
+
+---
+# --- Kube-State-Metrics ServiceAccount ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: our-kube-state-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-kube-state-metrics
+    app.kubernetes.io/part-of: our-monitoring-stack
+
+---
+# --- Alertmanager ServiceAccount ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: our-alertmanager
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-alertmanager
+    app.kubernetes.io/part-of: our-monitoring-stack
+
+---
+# =============================================================================
+# 3. RBAC — ClusterRole for Prometheus
+#    Prometheus needs cluster-wide read access to discover pods, nodes,
+#    services, and endpoints via Kubernetes SD (service discovery).
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: our-prometheus
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+rules:
+  # Pod, node, service, endpoint, namespace discovery
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - nodes/metrics
+      - services
+      - endpoints
+      - pods
+      - namespaces
+    verbs: ["get", "list", "watch"]
+  # Ingress discovery (optional but common)
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  # Non-resource URLs for /metrics and /healthz scraping
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
+
+---
+# RBAC — ClusterRoleBinding binds the above role to our-prometheus SA
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: our-prometheus
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: our-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: our-prometheus
+    namespace: monitoring
+
+---
+# RBAC — ClusterRole for kube-state-metrics
+#   Needs read access to virtually all K8s resource types to export state.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: our-kube-state-metrics
+  labels:
+    app.kubernetes.io/name: our-kube-state-metrics
+    app.kubernetes.io/part-of: our-monitoring-stack
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - secrets
+      - nodes
+      - pods
+      - services
+      - resourcequotas
+      - replicationcontrollers
+      - limitranges
+      - persistentvolumeclaims
+      - persistentvolumes
+      - namespaces
+      - endpoints
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - statefulsets
+      - daemonsets
+      - deployments
+      - replicasets
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["list", "watch"]
+
+---
+# RBAC — Bind kube-state-metrics ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: our-kube-state-metrics
+  labels:
+    app.kubernetes.io/name: our-kube-state-metrics
+    app.kubernetes.io/part-of: our-monitoring-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: our-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: our-kube-state-metrics
+    namespace: monitoring
+
+---
+# =============================================================================
+# 4. CONFIGMAP — Alert Rules
+#    Uses generic selector: container!="" (no pod name hardcoding)
+#    Rate window: [5m]   |   For duration: 20s
+#    Mirrors the working logic from the reference cluster.
+#
+#    v2 ADDITIONS (infrastructure layer):
+#      - LowDiskSpace       (node_filesystem_avail_bytes  < 10%, for: 1m)
+#      - CriticalDiskSpace  (node_filesystem_avail_bytes  <  5%, for: 1m)
+#      - PodNotScheduled    (kube_pod_status_scheduled == 0, for: 30s)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: our-alert-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+data:
+  alerting_rules.yml: |
+    groups:
+      # -----------------------------------------------------------------------
+      # [EXISTING] CPU Alert Group
+      # Fires when any container (container!="") sustains high CPU usage.
+      # Uses rate()[5m] averaged over a 5-minute window, fires after 20s.
+      # This is GENERIC — works on any workload, no pod name dependency.
+      # -----------------------------------------------------------------------
+      - name: cpu-alerts
+        rules:
+          - alert: HighCPUUsage
+            # Generic selector: matches ALL running containers, excludes
+            # pause/init containers which have container="" label.
+            expr: |
+              rate(container_cpu_usage_seconds_total{container!=""}[5m]) > 0.4
+            for: 20s
+            labels:
+              severity: warning
+              system: our-monitoring-stack
+            annotations:
+              summary: "High CPU usage detected across all containers"
+              value: "{{ $value }}"
+              description: >-
+                Total container CPU rate has exceeded 0.4 cores
+                for more than 20 seconds. Consider scaling or
+                investigating runaway processes.
+
+      # -----------------------------------------------------------------------
+      # [EXISTING] Per-Container CPU Alert (optional — useful for per-workload visibility)
+      # -----------------------------------------------------------------------
+      - name: per-container-cpu-alerts
+        rules:
+          - alert: ContainerHighCPU
+            expr: |
+              rate(container_cpu_usage_seconds_total{container!=""}[5m]) > 0.3
+            for: 20s
+            labels:
+              severity: warning
+              system: our-monitoring-stack
+            annotations:
+              summary: "Container {{ $labels.container }} in pod {{ $labels.pod }} has high CPU"
+              value: "{{ $value }}"
+              description: >-
+                Container {{ $labels.container }} is using more than 0.3 CPU cores
+                for over 20 seconds (namespace: {{ $labels.namespace }}).
+
+      # -----------------------------------------------------------------------
+      # [EXISTING] Node memory pressure alert
+      # -----------------------------------------------------------------------
+      - name: node-alerts
+        rules:
+          - alert: NodeHighMemoryUsage
+            expr: |
+              (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+                / node_memory_MemTotal_bytes > 0.85
+            for: 20s
+            labels:
+              severity: warning
+              system: our-monitoring-stack
+            annotations:
+              summary: "Node {{ $labels.instance }} memory usage above 85%"
+              value: "{{ $value }}"
+              description: >-
+                Node {{ $labels.instance }} is using more than 85% of available
+                memory for over 20 seconds.
+
+      # -----------------------------------------------------------------------
+      # [NEW v2] Infrastructure Alert — Node Disk Space
+      #
+      # Metric source: node-exporter → node_filesystem_avail_bytes
+      # Fires when any real (non-tmpfs) filesystem has < 10% free space.
+      #
+      # WHY THIS MATTERS IN PRODUCTION:
+      #   A full disk on a Kubernetes node causes kubelet to enter disk-pressure
+      #   mode, which triggers automatic pod eviction. This alert gives operators
+      #   10% headroom to act before eviction begins — preventing cascading
+      #   failures cluster-wide.
+      #
+      # DESIGN CHOICES:
+      #   fstype!="tmpfs"  → Excludes in-memory virtual filesystems.
+      #   fstype!="squashfs" → Excludes snap/OCI layer mounts (read-only).
+      #   mountpoint!~"^/var/lib/docker/.*"  → Excludes per-container overlay
+      #     mounts that node-exporter exposes on busy nodes (prevents noise).
+      #   mountpoint!~"^/run/.*"   → Excludes ephemeral runtime mounts.
+      #   mountpoint!~"^/sys/.*"   → Excludes kernel virtual fs.
+      #   mountpoint!~"^/dev/.*"   → Excludes device pseudo-filesystems.
+      #   Percentage-based (< 10%) scales correctly from 20 GB to 2 TB disks.
+      #   for: 1m  → Prevents flapping from brief I/O bursts.
+      # -----------------------------------------------------------------------
+      - name: node-disk-alerts
+        rules:
+          - alert: LowDiskSpace
+            expr: |
+              (
+                node_filesystem_avail_bytes{
+                  fstype!="tmpfs",
+                  fstype!="squashfs",
+                  mountpoint!~"^/var/lib/docker/.*",
+                  mountpoint!~"^/run/.*",
+                  mountpoint!~"^/sys/.*",
+                  mountpoint!~"^/dev/.*"
+                }
+                /
+                node_filesystem_size_bytes{
+                  fstype!="tmpfs",
+                  fstype!="squashfs",
+                  mountpoint!~"^/var/lib/docker/.*",
+                  mountpoint!~"^/run/.*",
+                  mountpoint!~"^/sys/.*",
+                  mountpoint!~"^/dev/.*"
+                }
+              ) < 0.10
+            for: 1m
+            labels:
+              severity: warning
+              system: our-monitoring-stack
+              layer: infrastructure
+            annotations:
+              summary: >-
+                Node {{ $labels.instance }} — {{ $labels.mountpoint }} below 10% free
+              value: "{{ $value }}"
+              description: >-
+                Filesystem {{ $labels.mountpoint }} ({{ $labels.fstype }}) on node
+                {{ $labels.instance }} has less than 10% disk space available.
+                Current free ratio: {{ $value | humanizePercentage }}.
+                Kubernetes nodes under disk pressure begin evicting pods automatically.
+                Take action before the node enters DiskPressure state.
+
+          # Critical tier — fires at < 5% free (eviction may have started)
+          - alert: CriticalDiskSpace
+            expr: |
+              (
+                node_filesystem_avail_bytes{
+                  fstype!="tmpfs",
+                  fstype!="squashfs",
+                  mountpoint!~"^/var/lib/docker/.*",
+                  mountpoint!~"^/run/.*",
+                  mountpoint!~"^/sys/.*",
+                  mountpoint!~"^/dev/.*"
+                }
+                /
+                node_filesystem_size_bytes{
+                  fstype!="tmpfs",
+                  fstype!="squashfs",
+                  mountpoint!~"^/var/lib/docker/.*",
+                  mountpoint!~"^/run/.*",
+                  mountpoint!~"^/sys/.*",
+                  mountpoint!~"^/dev/.*"
+                }
+              ) < 0.05
+            for: 1m
+            labels:
+              severity: critical
+              system: our-monitoring-stack
+              layer: infrastructure
+            annotations:
+              summary: >-
+                CRITICAL: Node {{ $labels.instance }} — {{ $labels.mountpoint }} below 5% free
+              value: "{{ $value }}"
+              description: >-
+                Filesystem {{ $labels.mountpoint }} on node {{ $labels.instance }}
+                has critically low disk space (< 5% free). Pod eviction may have
+                already started. Immediate action required.
+
+      # -----------------------------------------------------------------------
+      # [NEW v2] Infrastructure Alert — Pod Scheduling Failure
+      #
+      # Metric source: kube-state-metrics → kube_pod_status_scheduled
+      # Fires when any pod cannot be placed on a node for > 30 seconds.
+      #
+      # WHY THIS MATTERS IN PRODUCTION:
+      #   Pods stuck unscheduled are invisible from an application perspective —
+      #   the workload simply never starts, causing silent service degradation.
+      #   Root causes include insufficient node capacity, node selectors that no
+      #   node satisfies, missing PVC bindings, or taint/toleration mismatches.
+      #   This alert surfaces scheduler failures to operators within 30 seconds.
+      #
+      # DESIGN CHOICES:
+      #   condition="false"  → kube-state-metrics sets this label when the
+      #     Kubernetes scheduler reports PodScheduled=False. More precise than
+      #     watching pod phase alone (a pod can be "Pending" for many reasons).
+      #   == 1  → The metric is a gauge: 1 = condition is active, 0 = not.
+      #   No pod name / namespace filter → Works across all namespaces.
+      #   for: 30s  → Scheduler may need a few seconds after pod creation;
+      #     30s eliminates transient false positives while still flagging
+      #     genuinely stuck pods quickly.
+      # -----------------------------------------------------------------------
+      - name: pod-scheduling-alerts
+        rules:
+          - alert: PodNotScheduled
+            expr: |
+              kube_pod_status_scheduled{condition="false"} == 1
+            for: 30s
+            labels:
+              severity: warning
+              system: our-monitoring-stack
+              layer: infrastructure
+            annotations:
+              summary: >-
+                Pod {{ $labels.namespace }}/{{ $labels.pod }} cannot be scheduled
+              value: "{{ $value }}"
+              description: >-
+                Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been
+                unschedulable for more than 30 seconds.
+                Common causes:
+                  - Insufficient CPU or memory on all available nodes
+                  - Node selector / affinity rule that no node satisfies
+                  - Missing or unbound PersistentVolumeClaim
+                  - Taint on all nodes without a matching toleration
+                Investigate with:
+                  kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+
+---
+# =============================================================================
+# 5. CONFIGMAP — Prometheus Server Configuration
+#    - Scrapes: API server, nodes (cadvisor), pods, service endpoints,
+#               node-exporter, kube-state-metrics
+#    - Alertmanager: points to our-alertmanager service (in-cluster)
+#    - No localhost dependency — uses cluster DNS names
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: our-prometheus-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+data:
+  prometheus.yml: |
+    global:
+      # How often Prometheus scrapes targets
+      scrape_interval: 30s
+      # How often alert rules are evaluated
+      evaluation_interval: 30s
+      scrape_timeout: 10s
+
+    # -------------------------------------------------------------------------
+    # Rule files — loaded from the /etc/config volume (our-alert-rules CM)
+    # -------------------------------------------------------------------------
+    rule_files:
+      - /etc/config/alerting_rules.yml
+
+    # -------------------------------------------------------------------------
+    # Alertmanager connection — uses cluster DNS, no localhost
+    # -------------------------------------------------------------------------
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - our-alertmanager.monitoring.svc.cluster.local:9093
+
+    # =========================================================================
+    # SCRAPE CONFIGS
+    # =========================================================================
+    scrape_configs:
+
+      # -----------------------------------------------------------------------
+      # Prometheus self-monitoring
+      # -----------------------------------------------------------------------
+      - job_name: prometheus
+        static_configs:
+          - targets:
+              - localhost:9090
+
+      # -----------------------------------------------------------------------
+      # Kubernetes API Server
+      # Scrapes the API server's own /metrics endpoint via HTTPS.
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-api-servers
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels:
+              - __meta_kubernetes_namespace
+              - __meta_kubernetes_service_name
+              - __meta_kubernetes_endpoint_port_name
+            action: keep
+            regex: default;kubernetes;https
+
+      # -----------------------------------------------------------------------
+      # Kubernetes Nodes
+      # Scrapes Kubelet metrics from each node.
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-nodes
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+      # -----------------------------------------------------------------------
+      # cAdvisor (Container Advisor)
+      # Scrapes container-level CPU/memory/network metrics from each node's
+      # /metrics/cadvisor endpoint. These are the metrics used by alert rules.
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-nodes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        metrics_path: /metrics/cadvisor
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - source_labels: [__metrics_path__]
+            target_label: metrics_path
+
+      # -----------------------------------------------------------------------
+      # Kubernetes Pods (annotation-based scraping)
+      # Scrapes pods that have: prometheus.io/scrape="true" annotation.
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-pods
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only scrape pods that opt-in with annotation
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Respect custom scheme annotation
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          # Respect custom path annotation
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            regex: (.+)
+            target_label: __metrics_path__
+          # Build address from IP + port annotation (IPv4)
+          - source_labels:
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+              - __meta_kubernetes_pod_ip
+            action: replace
+            regex: (\d+);((([0-9]+?)(\.|$)){4})
+            replacement: $2:$1
+            target_label: __address__
+          # Build address from IP + port annotation (IPv6)
+          - source_labels:
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+              - __meta_kubernetes_pod_ip
+            action: replace
+            regex: (\d+);(([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4})
+            replacement: '[$2]:$1'
+            target_label: __address__
+          # Propagate all pod labels to Prometheus labels
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          # Add namespace and pod labels for filtering
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          # Drop completed/failed pods
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: drop
+            regex: Pending|Succeeded|Failed|Completed
+
+      # -----------------------------------------------------------------------
+      # Service Endpoints (annotation-based)
+      # Scrapes services annotated with prometheus.io/scrape="true".
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-service-endpoints
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            regex: (.+)
+            target_label: __metrics_path__
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_service_annotation_prometheus_io_port
+            action: replace
+            regex: (.+?)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: service
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+      # -----------------------------------------------------------------------
+      # Node Exporter (static scrape via cluster-internal DNS)
+      # Provides host-level metrics: cpu, memory, disk, network per node.
+      # -----------------------------------------------------------------------
+      - job_name: node-exporter
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - monitoring
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: our-node-exporter
+
+      # -----------------------------------------------------------------------
+      # Kube-State-Metrics (static scrape via cluster-internal DNS)
+      # Provides Kubernetes object-level state: deployment replicas,
+      # pod status, job success/failure, etc.
+      # -----------------------------------------------------------------------
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets:
+              - our-kube-state-metrics.monitoring.svc.cluster.local:8080
+
+---
+# =============================================================================
+# 6. CONFIGMAP — Alertmanager Configuration
+#    Receives alerts from Prometheus and routes them.
+#    Default receiver just logs (no external dependency).
+#    Extend the 'receivers' section with email/Slack/PagerDuty as needed.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: our-alertmanager-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-alertmanager
+    app.kubernetes.io/part-of: our-monitoring-stack
+data:
+  alertmanager.yml: |
+    global:
+      # Resolve timeout: how long to wait before marking an alert "resolved"
+      resolve_timeout: 5m
+
+    # -------------------------------------------------------------------------
+    # Route tree — all alerts go to default-receiver
+    # Customise here to add email/slack/pagerduty routing
+    # -------------------------------------------------------------------------
+    route:
+      group_by: ["alertname", "namespace"]
+      group_wait: 5s
+      group_interval: 30s
+      repeat_interval: 1m
+      receiver: n8n-telemetry
+
+    # -------------------------------------------------------------------------
+    # Receivers
+    # n8n-telemetry: connects to n8n webhook
+    # -------------------------------------------------------------------------
+    receivers:
+      - name: n8n-telemetry
+        webhook_configs:
+          - url: "http://host.minikube.internal:5678/webhook/autoflow/telemetry"
+            send_resolved: true
+
+    templates:
+      - /etc/alertmanager/*.tmpl
+
+---
+# =============================================================================
+# 7. NODE EXPORTER — DaemonSet
+#    Runs on EVERY node. Mounts host proc/sys/root read-only.
+#    Provides: node_cpu_seconds_total, node_memory_MemAvailable_bytes, etc.
+# =============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: our-node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-node-exporter
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: our-node-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: our-node-exporter
+        app.kubernetes.io/part-of: our-monitoring-stack
+    spec:
+      serviceAccountName: our-node-exporter
+      automountServiceAccountToken: false
+      hostNetwork: true   # Required: reads host network stats
+      hostPID: true       # Required: reads host process stats
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        # Run on ALL nodes including tainted ones (control-plane etc.)
+        - effect: NoSchedule
+          operator: Exists
+      securityContext:
+        fsGroup: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.10.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --path.udev.data=/host/root/run/udev/data
+            - --web.listen-address=[$(HOST_IP)]:9100
+          env:
+            - name: HOST_IP
+              value: "0.0.0.0"
+          ports:
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          livenessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              mountPropagation: HostToContainer
+              readOnly: true
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+
+---
+# Node Exporter Service — exposes port 9100 for Prometheus to scrape
+apiVersion: v1
+kind: Service
+metadata:
+  name: our-node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-node-exporter
+    app.kubernetes.io/part-of: our-monitoring-stack
+  annotations:
+    # This annotation causes it to be auto-discovered by the
+    # kubernetes-service-endpoints scrape job
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9100"
+spec:
+  selector:
+    app.kubernetes.io/name: our-node-exporter
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: metrics
+      protocol: TCP
+  clusterIP: None   # Headless: one endpoint per pod (per node)
+
+---
+# =============================================================================
+# 8. KUBE-STATE-METRICS — Deployment
+#    Watches the Kubernetes API and exports state as Prometheus metrics.
+#    Resources: kube_pod_status_phase, kube_deployment_status_replicas, etc.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: our-kube-state-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-kube-state-metrics
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: our-kube-state-metrics
+  strategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: our-kube-state-metrics
+        app.kubernetes.io/part-of: our-monitoring-stack
+    spec:
+      serviceAccountName: our-kube-state-metrics
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.18.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8080
+            - --resources=certificatesigningrequests,configmaps,cronjobs,daemonsets,deployments,endpointslices,horizontalpodautoscalers,ingresses,jobs,leases,limitranges,mutatingwebhookconfigurations,namespaces,networkpolicies,nodes,persistentvolumeclaims,persistentvolumes,poddisruptionbudgets,pods,replicasets,replicationcontrollers,resourcequotas,secrets,services,statefulsets,storageclasses,validatingwebhookconfigurations,volumeattachments
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 8081
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+---
+# Kube-State-Metrics Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: our-kube-state-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-kube-state-metrics
+    app.kubernetes.io/part-of: our-monitoring-stack
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  selector:
+    app.kubernetes.io/name: our-kube-state-metrics
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 8081
+      targetPort: metrics
+      protocol: TCP
+
+---
+# =============================================================================
+# 9. ALERTMANAGER — StatefulSet + PVC
+#    StatefulSet ensures stable network identity and persistent storage
+#    for alert state (silence history, etc.).
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: our-alertmanager
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-alertmanager
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: our-alertmanager
+  serviceName: our-alertmanager-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: our-alertmanager
+        app.kubernetes.io/part-of: our-monitoring-stack
+    spec:
+      serviceAccountName: our-alertmanager
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: alertmanager
+          image: quay.io/prometheus/alertmanager:v0.31.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --storage.path=/alertmanager
+            - --config.file=/etc/alertmanager/alertmanager.yml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.podIP
+          ports:
+            - name: http
+              containerPort: 9093
+              protocol: TCP
+          securityContext:
+            runAsGroup: 65534
+            runAsNonRoot: true
+            runAsUser: 65534
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: storage
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: our-alertmanager-config
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+# Alertmanager Service (ClusterIP — Prometheus routes alerts to this)
+apiVersion: v1
+kind: Service
+metadata:
+  name: our-alertmanager
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-alertmanager
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  selector:
+    app.kubernetes.io/name: our-alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+      protocol: TCP
+
+---
+# Alertmanager Headless Service (required by StatefulSet for stable DNS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: our-alertmanager-headless
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-alertmanager
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  selector:
+    app.kubernetes.io/name: our-alertmanager
+  clusterIP: None
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+      protocol: TCP
+
+---
+# =============================================================================
+# 10. PROMETHEUS SERVER — Deployment
+#     Two containers:
+#       a) prometheus-config-reloader: watches /etc/config for changes
+#          and hot-reloads Prometheus without restart
+#       b) prometheus-server: the main Prometheus process
+#
+#     Volumes:
+#       - our-prometheus-config CM → /etc/config/prometheus.yml
+#       - our-alert-rules CM      → /etc/config/alerting_rules.yml
+#       - PVC                     → /data (TSDB storage, 15d retention)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: our-prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: our-prometheus
+      app.kubernetes.io/component: server
+  strategy:
+    type: Recreate   # Avoids dual-writer conflicts on the TSDB
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: our-prometheus
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: our-monitoring-stack
+    spec:
+      serviceAccountName: our-prometheus
+      securityContext:
+        fsGroup: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+      terminationGracePeriodSeconds: 300
+      containers:
+        # --------------------------------------------------------------------
+        # Sidecar: prometheus-config-reloader
+        # Watches the config volume. On change, calls Prometheus /-/reload.
+        # This lets you update alert rules WITHOUT restarting the pod.
+        # --------------------------------------------------------------------
+        - name: prometheus-config-reloader
+          image: quay.io/prometheus-operator/prometheus-config-reloader:v0.90.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --watched-dir=/etc/config
+            - --listen-address=0.0.0.0:8080
+            - --reload-url=http://127.0.0.1:9090/-/reload
+          ports:
+            - name: reloader
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: reloader
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: reloader
+            periodSeconds: 10
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config
+              readOnly: true
+
+        # --------------------------------------------------------------------
+        # Main container: Prometheus Server
+        # Storage retention: 15d (configurable via --storage.tsdb.retention.time)
+        # Config file: /etc/config/prometheus.yml
+        # --------------------------------------------------------------------
+        - name: prometheus-server
+          image: quay.io/prometheus/prometheus:v3.11.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --storage.tsdb.retention.time=15d
+            - --config.file=/etc/config/prometheus.yml
+            - --storage.tsdb.path=/data
+            - --web.console.libraries=/etc/prometheus/console_libraries
+            - --web.console.templates=/etc/prometheus/consoles
+            - --web.enable-lifecycle   # Enables POST /-/reload for hot reload
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 3
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config
+            - name: storage-volume
+              mountPath: /data
+
+      volumes:
+        # Combined volume: prometheus.yml + alerting_rules.yml
+        # Both ConfigMaps are projected into a single directory /etc/config
+        - name: config-volume
+          projected:
+            sources:
+              - configMap:
+                  name: our-prometheus-config
+              - configMap:
+                  name: our-alert-rules
+        # Persistent volume for TSDB data
+        - name: storage-volume
+          persistentVolumeClaim:
+            claimName: our-prometheus-storage
+
+---
+# Prometheus PVC — stores time-series data (15d retention)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: our-prometheus-storage
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+
+---
+# Prometheus Service — exposes port 9090 for UI and scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: our-prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: our-monitoring-stack
+spec:
+  selector:
+    app.kubernetes.io/name: our-prometheus
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+
+# =============================================================================
+# END OF our-system.yaml
+# =============================================================================
+#
+# QUICK REFERENCE — Deploy & Verify:
+#
+#   1. Deploy:
+#      kubectl apply -f our-system.yaml
+#
+#   2. Watch pods come up:
+#      kubectl get pods -n monitoring -w
+#
+#   3. Access Prometheus UI:
+#      kubectl port-forward svc/our-prometheus -n monitoring 9090:9090
+#      # → http://localhost:9090
+#      # →  Status > Targets  (check all scrapers are UP)
+#      # →  Alerts            (HighCPUUsage should appear when CPU > 0.4)
+#
+#   4. Access Alertmanager UI:
+#      kubectl port-forward svc/our-alertmanager -n monitoring 9093:9093
+#      # → http://localhost:9093
+#
+#   5. Trigger a CPU alert (see stress-test.yaml):
+#      kubectl apply -f stress-test.yaml
+#      # Wait ~30s → alert fires in Prometheus → forwarded to Alertmanager
+#
+#   6. Teardown (does NOT touch any existing cluster components):
+#      kubectl delete namespace monitoring
+#
+# =============================================================================

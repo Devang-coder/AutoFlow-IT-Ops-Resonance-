@@ -1,0 +1,979 @@
+{
+  "name": "AutoFlow AI 1 2",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "autoflow/telemetry",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "84f45a55-f9ba-4fd3-9da2-5578af2baf63",
+      "name": "Telemetry Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        256,
+        5680
+      ],
+      "webhookId": "autoflow-telemetry-v1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.body || $input.first().json;\n\n// ────────────────────────────────────────────────\n// v2 EXTENSION: Handle Prometheus Alertmanager format\n// New alerts: LowDiskSpace, CriticalDiskSpace, PodNotScheduled\n// Alertmanager sends { alerts: [ { status, labels, annotations, ... } ] }\n// ────────────────────────────────────────────────\nlet alertData = null;\nif (raw.alerts && Array.isArray(raw.alerts) && raw.alerts.length > 0) {\n  const alert = raw.alerts[0];\n  const alertname = alert.labels?.alertname || '';\n  \n  // Map Prometheus alert names to AutoFlow metric types\n  const alertMetricMap = {\n    'HighCPUUsage': { metric_type: 'cpu_usage', unit: '%' },\n    'ContainerHighCPU': { metric_type: 'cpu_usage', unit: '%' },\n    'NodeHighMemoryUsage': { metric_type: 'memory_usage', unit: '%' },\n    'LowDiskSpace': { metric_type: 'disk_space_free_percent', unit: '%' },\n    'CriticalDiskSpace': { metric_type: 'disk_space_free_percent', unit: '%' },\n    'PodNotScheduled': { metric_type: 'pod_scheduling', unit: 'boolean' }\n  };\n  \n  const mapped = alertMetricMap[alertname] || { metric_type: alertname.toLowerCase(), unit: '%' };\n  \n  // Extract metric value from annotations or labels\n  let metricValue = 0;\n  if (alertname === 'PodNotScheduled') {\n    metricValue = 1; // Binary: 1 = scheduling failure detected\n  } else if (alertname === 'LowDiskSpace' || alertname === 'CriticalDiskSpace') {\n    // Value comes as ratio (0.0-1.0) from PromQL, convert to percent\n    const rawVal = parseFloat(alert.annotations?.value || alert.labels?.value || 0);\n    metricValue = rawVal < 1 ? Math.round(rawVal * 100 * 100) / 100 : rawVal;\n  } else {\n    metricValue = parseFloat(alert.annotations?.value || alert.labels?.value || 0);\n  }\n  \n  alertData = {\n    service_name: alert.labels?.service || alert.labels?.pod || alert.labels?.instance || 'kubernetes-node',\n    namespace: alert.labels?.namespace || 'monitoring',\n    pod_name: alert.labels?.pod || null,\n    node_name: alert.labels?.instance || alert.labels?.node || null,\n    metric_type: mapped.metric_type,\n    metric_value: metricValue,\n    metric_unit: mapped.unit,\n    source: 'prometheus-alertmanager',\n    environment: alert.labels?.environment || 'production',\n    alert_name: alertname,\n    alert_status: alert.status || 'firing',\n    alert_severity: alert.labels?.severity || 'warning',\n    alert_layer: alert.labels?.layer || 'application',\n    mountpoint: alert.labels?.mountpoint || null,\n    fstype: alert.labels?.fstype || null\n  };\n}\n\n// Build the normalized event\nconst event = {\n  event_id: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,\n  service_name: alertData?.service_name || raw.service_name || raw.labels?.job || 'unknown-service',\n  namespace: alertData?.namespace || raw.namespace || raw.labels?.namespace || 'default',\n  pod_name: alertData?.pod_name || raw.pod_name || raw.labels?.pod || null,\n  node_name: alertData?.node_name || raw.node_name || raw.labels?.node || null,\n  metric_type: alertData?.metric_type || raw.metric_type || raw.metric || 'cpu_usage',\n  metric_value: alertData ? alertData.metric_value : parseFloat(raw.metric_value || raw.value || 0),\n  metric_unit: alertData?.metric_unit || raw.unit || '%',\n  source: alertData?.source || raw.source || 'prometheus',\n  environment: alertData?.environment || raw.environment || 'production',\n  timestamp: raw.timestamp || new Date().toISOString(),\n  raw_payload: JSON.stringify(raw),\n  // v2 extension fields\n  alert_name: alertData?.alert_name || null,\n  alert_severity: alertData?.alert_severity || null,\n  alert_layer: alertData?.alert_layer || null,\n  mountpoint: alertData?.mountpoint || null,\n  fstype: alertData?.fstype || null\n};\n\nif (!event.service_name || event.metric_value === undefined) {\n  throw new Error('Invalid telemetry: missing service_name or metric_value');\n}\n\nreturn { json: event };"
+      },
+      "id": "43a618fb-8c91-476e-8be2-7a339ce1fd6f",
+      "name": "Normalize Telemetry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        5680
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT metric_value FROM autoflow_events WHERE service_name = '{{ $json.service_name }}' AND metric_type = '{{ $json.metric_type }}' AND recorded_at > NOW() - INTERVAL '1 hour' ORDER BY recorded_at DESC LIMIT 60;",
+        "options": {}
+      },
+      "id": "dc03cfa1-bedc-4f2f-958a-9bd125121e09",
+      "name": "Fetch Historical Baseline",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        672,
+        5680
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "RLKS6ADE3RC97eXY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const event = $('Normalize Telemetry').first().json;\nconst historicalData = $input.all().map(r => parseFloat(r.json.metric_value)).filter(v => !isNaN(v));\n\n// ────────────────────────────────────────────────\n// v2 EXTENSION: Added thresholds for new infrastructure alerts\n//   disk_space_free_percent: < 10% = warning, < 5% = critical\n//   pod_scheduling: any value of 1 = immediate anomaly (binary)\n// ────────────────────────────────────────────────\nconst thresholds = { \n  cpu_usage: 85, \n  memory_usage: 90, \n  error_rate: 5, \n  latency_ms: 2000, \n  disk_usage: 95,\n  disk_space_free_percent: 10,\n  pod_scheduling: 0.5\n};\nconst threshold = thresholds[event.metric_type] || 80;\n\n// v2: PodNotScheduled is inherently an anomaly — binary detection\nif (event.metric_type === 'pod_scheduling' && event.metric_value >= 1) {\n  return { json: {\n    ...event,\n    is_anomaly: true,\n    z_score: 99,\n    baseline_mean: 0,\n    baseline_stddev: 0,\n    detection_method: 'binary_infrastructure_alert',\n    anomaly_severity: 'critical',\n    confidence: 0.95,\n    historical_samples: 0,\n    infrastructure_alert: true,\n    alert_category: 'pod_scheduling_failure'\n  }};\n}\n\n// v2: Disk space alerts — lower value = worse (inverted threshold)\nif (event.metric_type === 'disk_space_free_percent') {\n  const isCritical = event.metric_value < 5;\n  const isLow = event.metric_value < 10;\n  const isAnomaly = isLow;\n  return { json: {\n    ...event,\n    is_anomaly: isAnomaly,\n    z_score: isAnomaly ? (isCritical ? 5.0 : 3.0) : 0,\n    baseline_mean: 50,\n    baseline_stddev: 15,\n    detection_method: 'threshold_infrastructure_alert',\n    anomaly_severity: isCritical ? 'critical' : (isLow ? 'high' : 'none'),\n    confidence: isCritical ? 0.95 : (isLow ? 0.80 : 0),\n    historical_samples: 0,\n    infrastructure_alert: true,\n    alert_category: isCritical ? 'critical_disk_space' : 'low_disk_space'\n  }};\n}\n\nlet result;\n\nif (historicalData.length >= 10) {\n  const mean = historicalData.reduce((a, b) => a + b, 0) / historicalData.length;\n  const variance = historicalData.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / historicalData.length;\n  const stddev = Math.sqrt(variance);\n  const zScore = stddev > 0 ? (event.metric_value - mean) / stddev : 0;\n  const recentMean = historicalData.slice(0, 5).reduce((a, b) => a + b, 0) / Math.min(5, historicalData.length);\n  const spikeRatio = recentMean > 0 ? event.metric_value / recentMean : 1;\n  const exceedsThreshold = event.metric_value > threshold;\n  const isAnomaly = Math.abs(zScore) > 2.5 || exceedsThreshold || spikeRatio > 2.0;\n\n  let severity = 'none', confidence = 0;\n  if (isAnomaly) {\n    if (Math.abs(zScore) > 4 || (exceedsThreshold && event.metric_value > threshold * 1.2)) { severity = 'critical'; confidence = 0.95; }\n    else if (Math.abs(zScore) > 3 || exceedsThreshold) { severity = 'high'; confidence = 0.80; }\n    else { severity = 'medium'; confidence = 0.65; }\n  }\n\n  result = { ...event, is_anomaly: isAnomaly, z_score: Math.round(zScore * 100) / 100, baseline_mean: Math.round(mean * 100) / 100, baseline_stddev: Math.round(stddev * 100) / 100, spike_ratio: Math.round(spikeRatio * 100) / 100, exceeds_threshold: exceedsThreshold, threshold_value: threshold, detection_method: 'zscore_threshold_spike', anomaly_severity: severity, confidence, historical_samples: historicalData.length };\n} else {\n  const exceedsThreshold = event.metric_value > threshold;\n  result = { ...event, is_anomaly: exceedsThreshold, z_score: 0, baseline_mean: 0, baseline_stddev: 0, detection_method: 'threshold_only', anomaly_severity: exceedsThreshold ? 'medium' : 'none', confidence: exceedsThreshold ? 0.5 : 0, historical_samples: historicalData.length };\n}\n\nreturn { json: result };"
+      },
+      "id": "528d13a0-6436-492c-865f-9c1e155bb132",
+      "name": "Z-Score Anomaly Detection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        5680
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autoflow_events (event_id, service_name, namespace, pod_name, node_name, metric_type, metric_value, metric_unit, source, environment, is_anomaly, z_score, baseline_mean, baseline_stddev, anomaly_severity, confidence, detection_method, raw_payload, recorded_at) VALUES ('{{ $json.event_id }}', '{{ $json.service_name }}', '{{ $json.namespace }}', {{ $json.pod_name !== null ? \"'\" + $json.pod_name + \"'\" : 'NULL' }}, {{ $json.node_name !== null ? \"'\" + $json.node_name + \"'\" : 'NULL' }}, '{{ $json.metric_type }}', {{ $json.metric_value }}, '{{ $json.metric_unit }}', '{{ $json.source }}', '{{ $json.environment }}', {{ $json.is_anomaly }}, {{ $json.z_score }}, {{ $json.baseline_mean }}, {{ $json.baseline_stddev }}, '{{ $json.anomaly_severity }}', {{ $json.confidence }}, '{{ $json.detection_method }}', '{{ $json.safe_raw_payload }}', '{{ $json.timestamp }}') RETURNING id;",
+        "options": {}
+      },
+      "id": "3df00aaa-4257-4364-a55c-b88cd846ea51",
+      "name": "Save Event to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1344,
+        5680
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RLKS6ADE3RC97eXY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "anomaly-check",
+              "leftValue": "={{ $('Z-Score Anomaly Detection').first().json.is_anomaly }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c2c51582-3407-453d-aa05-07b902096135",
+      "name": "Is Anomaly?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        5680
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', event_id: $('Z-Score Anomaly Detection').first().json.event_id, is_anomaly: false, message: 'Event logged. No anomaly detected.' }) }}",
+        "options": {}
+      },
+      "id": "2c91f74e-eec6-40da-9ace-f2a06ef277b0",
+      "name": "Respond — No Anomaly",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1776,
+        5856
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Z-Score Anomaly Detection').first().json;\nreturn { json: input };"
+      },
+      "id": "86d8000c-2ad4-4431-969e-a4ea3e7acec3",
+      "name": "Receive Anomaly Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1776,
+        5520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer Bearer {{ $env.GROQ_API_KEY }}uSGxqlyWuGRPOiWhXV4hWGdyb3FYbW0PqPJY4bpfit9Pmx1efg8x"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are the Anomaly Agent for AutoFlow, an autonomous IT operations system. Analyse infrastructure telemetry and assess the statistical severity of the anomaly. Respond with ONLY valid JSON, no explanation, no markdown, no code blocks.' }, { role: 'user', content: 'Analyse this infrastructure anomaly and return ONLY this exact JSON structure:\\n{\"agent\":\"anomaly\",\"score\":<float 0.0-1.0>,\"reasoning\":\"<2 sentence max>\",\"recommended_action\":\"<one of: ignore|alert|restart_pod|scale_service|reroute_traffic>\",\"confidence\":<float 0.0-1.0>}\\n\\nIncident data:\\nService: ' + $('Receive Anomaly Event').first().json.service_name + '\\nNamespace: ' + $('Receive Anomaly Event').first().json.namespace + '\\nMetric: ' + $('Receive Anomaly Event').first().json.metric_type + '\\nCurrent Value: ' + $('Receive Anomaly Event').first().json.metric_value + $('Receive Anomaly Event').first().json.metric_unit + '\\nZ-Score: ' + $('Receive Anomaly Event').first().json.z_score + '\\nBaseline Mean: ' + $('Receive Anomaly Event').first().json.baseline_mean + '\\nBaseline StdDev: ' + $('Receive Anomaly Event').first().json.baseline_stddev + '\\nSeverity: ' + $('Receive Anomaly Event').first().json.anomaly_severity + '\\nDetection Confidence: ' + $('Receive Anomaly Event').first().json.confidence + '\\nHistorical Samples Used: ' + $('Receive Anomaly Event').first().json.historical_samples }], max_tokens: 300, temperature: 0.1 }) }}",
+        "options": {}
+      },
+      "id": "af170f86-538c-4ad7-9209-8ddec04a4a8b",
+      "name": "Anomaly Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1984,
+        5280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer Bearer {{ $env.GROQ_API_KEY }}uSGxqlyWuGRPOiWhXV4hWGdyb3FYbW0PqPJY4bpfit9Pmx1efg8x"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are the Risk Agent for AutoFlow. Assess blast radius — if this service fails completely, what is the downstream impact? Consider service criticality, dependencies, and cascading failure probability. Respond with ONLY valid JSON, no explanation, no markdown.' }, { role: 'user', content: 'Assess the risk and return ONLY this exact JSON:\\n{\"agent\":\"risk\",\"score\":<float 0.0-1.0>,\"blast_radius\":\"<one of: low|medium|high|critical>\",\"reasoning\":\"<2 sentence max>\",\"recommended_action\":\"<one of: ignore|alert|restart_pod|scale_service|reroute_traffic>\",\"confidence\":<float 0.0-1.0>}\\n\\nIncident data:\\nService: ' + $('Receive Anomaly Event').first().json.service_name + '\\nNamespace: ' + $('Receive Anomaly Event').first().json.namespace + '\\nEnvironment: ' + $('Receive Anomaly Event').first().json.environment + '\\nMetric: ' + $('Receive Anomaly Event').first().json.metric_type + ' at ' + $('Receive Anomaly Event').first().json.metric_value + $('Receive Anomaly Event').first().json.metric_unit + '\\nAnomaly Severity: ' + $('Receive Anomaly Event').first().json.anomaly_severity }], max_tokens: 300, temperature: 0.1 }) }}",
+        "options": {}
+      },
+      "id": "0540394e-6902-4e06-ace1-33b17fa52fde",
+      "name": "Risk Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2064,
+        5504
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer Bearer {{ $env.GROQ_API_KEY }}uSGxqlyWuGRPOiWhXV4hWGdyb3FYbW0PqPJY4bpfit9Pmx1efg8x"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are the SLA Agent for AutoFlow. Evaluate SLA breach risk. If this anomaly continues, how quickly will service level agreements be violated? Respond with ONLY valid JSON, no explanation, no markdown.' }, { role: 'user', content: 'Evaluate SLA risk and return ONLY this exact JSON:\\n{\"agent\":\"sla\",\"score\":<float 0.0-1.0>,\"time_to_breach_minutes\":<integer or null>,\"reasoning\":\"<2 sentence max>\",\"recommended_action\":\"<one of: ignore|alert|restart_pod|scale_service|reroute_traffic>\",\"confidence\":<float 0.0-1.0>}\\n\\nIncident data:\\nService: ' + $('Receive Anomaly Event').first().json.service_name + '\\nMetric: ' + $('Receive Anomaly Event').first().json.metric_type + ' at ' + $('Receive Anomaly Event').first().json.metric_value + $('Receive Anomaly Event').first().json.metric_unit + '\\nEnvironment: ' + $('Receive Anomaly Event').first().json.environment + '\\nZ-Score: ' + $('Receive Anomaly Event').first().json.z_score + '\\nSeverity: ' + $('Receive Anomaly Event').first().json.anomaly_severity }], max_tokens: 300, temperature: 0.1 }) }}",
+        "options": {}
+      },
+      "id": "8421fb81-d7a4-47f4-a36c-983910c8a06a",
+      "name": "SLA Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2128,
+        5696
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer Bearer {{ $env.GROQ_API_KEY }}uSGxqlyWuGRPOiWhXV4hWGdyb3FYbW0PqPJY4bpfit9Pmx1efg8x"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are the Context Agent for AutoFlow. Match current incidents against historical patterns and known scheduled events. Does this anomaly match expected behavior based on time, service, or past incidents? Respond with ONLY valid JSON, no explanation, no markdown.' }, { role: 'user', content: 'Assess pattern matching and return ONLY this exact JSON:\\n{\"agent\":\"context\",\"score\":<float 0.0-1.0>,\"pattern_match\":\"<one of: none|partial|strong>\",\"reasoning\":\"<2 sentence max>\",\"recommended_action\":\"<one of: ignore|alert|restart_pod|scale_service|reroute_traffic>\",\"confidence\":<float 0.0-1.0>}\\n\\nIncident data:\\nService: ' + $('Receive Anomaly Event').first().json.service_name + '\\nMetric: ' + $('Receive Anomaly Event').first().json.metric_type + ' at ' + $('Receive Anomaly Event').first().json.metric_value + $('Receive Anomaly Event').first().json.metric_unit + '\\nTimestamp: ' + $('Receive Anomaly Event').first().json.timestamp + '\\nEnvironment: ' + $('Receive Anomaly Event').first().json.environment }], max_tokens: 300, temperature: 0.1 }) }}",
+        "options": {}
+      },
+      "id": "49cedd2a-03b3-4113-bc89-deb8b7f21249",
+      "name": "Context Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        5888
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT agent_name, current_weight FROM autoflow_agent_weights WHERE is_active = true ORDER BY agent_name;",
+        "options": {}
+      },
+      "id": "6a6f6474-1e09-4041-9b33-b2d300db1557",
+      "name": "Fetch Agent Weights from DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2144,
+        6048
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RLKS6ADE3RC97eXY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const event = $('Receive Anomaly Event').first().json;\nconst allInputs = $input.all();\n\n// Parse agent responses - try both compact and spaced JSON key formats\nconst parseAgent = (inputs, agentName, fallbackIndex) => {\n  try {\n    const agentData = inputs.find(item => {\n      const content = item.json?.choices?.[0]?.message?.content;\n      if (!content) return false;\n      return content.includes(`\"agent\":\"${agentName}\"`) || \n             content.includes(`\"agent\": \"${agentName}\"`);\n    });\n    \n    // Fallback: use positional index (0=anomaly,1=risk,2=sla,3=context)\n    const source = agentData || (inputs[fallbackIndex]?.json?.choices ? inputs[fallbackIndex] : null);\n    if (!source) return { score: 0.5, reasoning: 'Agent not found', confidence: 0.5, recommended_action: 'alert' };\n    \n    const text = source.json.choices[0].message.content;\n    const cleaned = text.replace(/```json|```/g, '').trim();\n    const parsed = JSON.parse(cleaned);\n    return {\n      score: typeof parsed.score === 'number' ? parsed.score : 0.5,\n      reasoning: parsed.reasoning || 'No reasoning provided',\n      recommended_action: parsed.recommended_action || 'alert',\n      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,\n      ...parsed\n    };\n  } catch (e) {\n    return { score: 0.5, reasoning: 'Parse error: ' + e.message, confidence: 0.5, recommended_action: 'alert' };\n  }\n};\n\nconst agents = {\n  anomaly: parseAgent(allInputs, 'anomaly', 0),\n  risk: parseAgent(allInputs, 'risk', 1),\n  sla: parseAgent(allInputs, 'sla', 2),\n  context: parseAgent(allInputs, 'context', 3)\n};\n\n// Weights come from DB rows (items without .choices)\nconst weightsData = allInputs.filter(item => item.json.agent_name !== undefined);\nconst weights = {};\nweightsData.forEach(row => {\n  weights[row.json.agent_name] = parseFloat(row.json.current_weight);\n});\n\nconst defaultWeights = { anomaly: 0.30, risk: 0.35, sla: 0.25, context: 0.10 };\nconst w = { ...defaultWeights, ...weights };\n\n// Clamp scores to [0,1]\nconst clamp = v => Math.max(0, Math.min(1, v));\nconst consensus_score = \n  (clamp(agents.anomaly.score) * w.anomaly) +\n  (clamp(agents.risk.score) * w.risk) +\n  (clamp(agents.sla.score) * w.sla) +\n  (clamp(agents.context.score) * w.context);\n\nlet decision, remediation_action;\nif (consensus_score < 0.3) {\n  decision = 'ignore';\n  remediation_action = null;\n} else if (consensus_score < 0.6) {\n  decision = 'alert';\n  remediation_action = null;\n} else {\n  decision = 'remediate';\n  \n  // ────────────────────────────────────────────────\n  // v2 EXTENSION: Infrastructure-aware action selection\n  // Map new K8s v2 alert categories to appropriate remediation actions\n  // ────────────────────────────────────────────────\n  const alertCategory = event.alert_category || null;\n  const metricType = event.metric_type;\n  \n  if (alertCategory === 'pod_scheduling_failure' || metricType === 'pod_scheduling') {\n    remediation_action = 'reschedule_pod';\n  } else if (alertCategory === 'critical_disk_space' || alertCategory === 'low_disk_space' || metricType === 'disk_space_free_percent') {\n    remediation_action = 'cleanup_disk';\n  } else {\n    const actions = [\n      agents.anomaly.recommended_action, \n      agents.risk.recommended_action, \n      agents.sla.recommended_action,\n      agents.context.recommended_action\n    ];\n    remediation_action = actions.find(a => ['restart_pod', 'scale_service', 'reroute_traffic', 'drain_node', 'cleanup_disk', 'reschedule_pod'].includes(a)) || 'restart_pod';\n  }\n}\n\nreturn {\n  json: {\n    decision_id: `dec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,\n    event_id: event.event_id,\n    service_name: event.service_name,\n    namespace: event.namespace,\n    metric_type: event.metric_type,\n    metric_value: event.metric_value,\n    consensus_score: Math.round(consensus_score * 10000) / 10000,\n    decision,\n    remediation_action,\n    agents,\n    weights_used: w,\n    decided_at: new Date().toISOString(),\n    // v2: pass infrastructure context downstream\n    alert_name: event.alert_name || null,\n    alert_category: event.alert_category || null,\n    alert_layer: event.alert_layer || null,\n    infrastructure_alert: event.infrastructure_alert || false,\n    mountpoint: event.mountpoint || null,\n    node_name: event.node_name || null\n  }\n};"
+      },
+      "id": "a7f62c64-a8b8-48c5-952b-6245173a2512",
+      "name": "Consensus Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2592,
+        5680
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autoflow_decisions (decision_id, event_id, service_name, consensus_score, decision, remediation_action, anomaly_agent_score, risk_agent_score, sla_agent_score, context_agent_score, anomaly_reasoning, risk_reasoning, sla_reasoning, context_reasoning, weights_used, decided_at) VALUES ('{{ $json.decision_id }}', '{{ $json.event_id }}', '{{ $json.service_name }}', {{ $json.consensus_score }}, '{{ $json.decision }}', {{ $json.remediation_action ? \"'\" + $json.remediation_action + \"'\" : 'NULL' }}, {{ $json.agents.anomaly.score }}, {{ $json.agents.risk.score }}, {{ $json.agents.sla.score }}, {{ $json.agents.context.score }}, '{{ $json.safe_anomaly_reasoning }}', '{{ $json.safe_risk_reasoning }}', '{{ $json.safe_sla_reasoning }}', '{{ $json.safe_context_reasoning }}', '{{ $json.safe_weights_used }}', '{{ $json.decided_at }}') RETURNING id;",
+        "options": {}
+      },
+      "id": "2acb7a99-a1e7-4c0a-8edd-5abd462dfbae",
+      "name": "Save Decision to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2912,
+        5568
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RLKS6ADE3RC97eXY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Consensus Engine').first().json.decision }}",
+                    "rightValue": "remediate",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "7869214c-5836-44d8-bb7d-1620fbe641f0"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Remediate"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Consensus Engine').first().json.decision }}",
+                    "rightValue": "alert",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "0743e725-340b-4368-9bf2-992f04481da4"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Alert"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Consensus Engine').first().json.decision }}",
+                    "rightValue": "ignore",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "31065b9c-7a73-41eb-ae96-5a3b6435b88b"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Ignore"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3008ad9e-7589-4fa8-90f5-2994cb892373",
+      "name": "Decision Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        3104,
+        5552
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/autoflow/action",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ trigger: \"remediate\", decision_id: $('Consensus Engine').first().json.decision_id, event_id: $('Consensus Engine').first().json.event_id, service_name: $('Consensus Engine').first().json.service_name, namespace: $('Consensus Engine').first().json.namespace, consensus_score: $('Consensus Engine').first().json.consensus_score, decision: $('Consensus Engine').first().json.decision, remediation_action: $('Consensus Engine').first().json.remediation_action, agents: $('Consensus Engine').first().json.agents, metric_type: $('Consensus Engine').first().json.metric_type, metric_value: $('Consensus Engine').first().json.metric_value }) }}",
+        "options": {}
+      },
+      "id": "722acda1-3637-4ecd-a381-0ce1675637a7",
+      "name": "POST to Remediation Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        5376
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/autoflow/action",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "=",
+              "value": "={{ JSON.stringify({ trigger: \"alert\", decision_id: $json.decision_id, event_id: $json.event_id, service_name: $json.service_name, namespace: $json.namespace, consensus_score: $json.consensus_score, decision: $json.decision, agents: $json.agents }) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2657a80-c9db-4c49-8725-9f587c1d11df",
+      "name": "POST to Alert Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        5536
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE autoflow_events SET status = 'ignored', updated_at = NOW() WHERE event_id = '{{ $('Consensus Engine').first().json.event_id }}';",
+        "options": {}
+      },
+      "id": "6562e888-e804-4a3a-899d-b7dda41ed6e9",
+      "name": "Mark Event as Ignored",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3360,
+        5696
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RLKS6ADE3RC97eXY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'remediation_triggered', decision_id: $('Consensus Engine').first().json.decision_id }) }}",
+        "options": {}
+      },
+      "id": "1a40ddf8-9b68-4d71-9a9c-54de6a7d5348",
+      "name": "Respond — Remediation Triggered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        3616,
+        5376
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ trigger: \"alert\", decision_id: $('Consensus Engine').first().json.decision_id, event_id: $('Consensus Engine').first().json.event_id, service_name: $('Consensus Engine').first().json.service_name, namespace: $('Consensus Engine').first().json.namespace, consensus_score: $('Consensus Engine').first().json.consensus_score, decision: $('Consensus Engine').first().json.decision, agents: $('Consensus Engine').first().json.agents }) }}",
+        "options": {}
+      },
+      "id": "29915cef-90c1-4ccd-9dd5-8d4c14244350",
+      "name": "Respond — Alert Sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        3616,
+        5536
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ignored', event_id: $('Consensus Engine').first().json.event_id }) }}",
+        "options": {}
+      },
+      "id": "63ad7ab0-ff59-4119-9b7a-b908642987f2",
+      "name": "Respond — Ignored",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        3616,
+        5696
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2432,
+        5632
+      ],
+      "id": "57ef1cd5-9e2c-4bb0-8e1b-0a9a7d7f9975",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst escape = v => (v === null || v === undefined) ? null : String(v).replace(/'/g, \"''\");\nreturn {\n  json: {\n    ...d,\n    safe_raw_payload: escape(d.raw_payload)\n  }\n};"
+      },
+      "id": "0968f6d2-193e-447f-8e24-1bbe5022277f",
+      "name": "Sanitize Event Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        5680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst escape = v => (v === null || v === undefined) ? '' : String(v).replace(/'/g, \"''\");\nreturn {\n  json: {\n    ...d,\n    safe_anomaly_reasoning: escape(d.agents?.anomaly?.reasoning),\n    safe_risk_reasoning: escape(d.agents?.risk?.reasoning),\n    safe_sla_reasoning: escape(d.agents?.sla?.reasoning),\n    safe_context_reasoning: escape(d.agents?.context?.reasoning),\n    safe_weights_used: escape(JSON.stringify(d.weights_used))\n  }\n};"
+      },
+      "id": "a2b0d8cd-d608-403d-b644-4d4b1d8901fc",
+      "name": "Sanitize Decision Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2736,
+        5568
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3001/event",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ event_id: $('Sanitize Event Payload').first().json.event_id, service_name: $('Sanitize Event Payload').first().json.service_name, namespace: $('Sanitize Event Payload').first().json.namespace, metric_type: $('Sanitize Event Payload').first().json.metric_type, metric_value: $('Sanitize Event Payload').first().json.metric_value, is_anomaly: $('Sanitize Event Payload').first().json.is_anomaly, z_score: $('Sanitize Event Payload').first().json.z_score, anomaly_severity: $('Sanitize Event Payload').first().json.anomaly_severity, confidence: $('Sanitize Event Payload').first().json.confidence, status: $('Sanitize Event Payload').first().json.is_anomaly ? 'detected' : 'normal' }) }}",
+        "options": {}
+      },
+      "id": "38dacffd-d0f4-4571-a7d8-86d9fa346194",
+      "name": "POST Event to Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1504,
+        5872
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3001/decision",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ decision_id: $('Consensus Engine').first().json.decision_id, event_id: $('Consensus Engine').first().json.event_id, consensus_score: $('Consensus Engine').first().json.consensus_score, decision: $('Consensus Engine').first().json.decision, remediation_action: $('Consensus Engine').first().json.remediation_action, anomaly_agent_score: $('Consensus Engine').first().json.agents?.anomaly?.score || 0, risk_agent_score: $('Consensus Engine').first().json.agents?.risk?.score || 0, sla_agent_score: $('Consensus Engine').first().json.agents?.sla?.score || 0, context_agent_score: $('Consensus Engine').first().json.agents?.context?.score || 0, anomaly_reasoning: $('Consensus Engine').first().json.agents?.anomaly?.reasoning || '', risk_reasoning: $('Consensus Engine').first().json.agents?.risk?.reasoning || '', sla_reasoning: $('Consensus Engine').first().json.agents?.sla?.reasoning || '', context_reasoning: $('Consensus Engine').first().json.agents?.context?.reasoning || '', weights_used: $('Consensus Engine').first().json.weights_used || {} }) }}",
+        "options": {}
+      },
+      "id": "6c172e22-d495-4f1d-ac28-ceafebb6de48",
+      "name": "POST Decision to Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2944,
+        5872
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3001/action",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ action_id: 'ign_' + Date.now() + '_' + Math.random().toString(36).substr(2,5), decision_id: $('Consensus Engine').first().json.decision_id, action_type: 'ignored', action_status: 'success', outcome: 'no_action_needed' }) }}",
+        "options": {}
+      },
+      "id": "2a4686eb-c167-4455-8c01-5f553cc350b6",
+      "name": "Notify Backend — Ignored",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3504,
+        5904
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telemetry Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Telemetry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Telemetry": {
+      "main": [
+        [
+          {
+            "node": "Fetch Historical Baseline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Historical Baseline": {
+      "main": [
+        [
+          {
+            "node": "Z-Score Anomaly Detection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Z-Score Anomaly Detection": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Event Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Event to DB": {
+      "main": [
+        [
+          {
+            "node": "Is Anomaly?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "POST Event to Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Anomaly?": {
+      "main": [
+        [
+          {
+            "node": "Receive Anomaly Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond — No Anomaly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Receive Anomaly Event": {
+      "main": [
+        [
+          {
+            "node": "Anomaly Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Risk Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SLA Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Context Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Agent Weights from DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anomaly Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Consensus Engine": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Decision Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Decision to DB": {
+      "main": [
+        [
+          {
+            "node": "Decision Router",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "POST Decision to Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decision Router": {
+      "main": [
+        [
+          {
+            "node": "POST to Remediation Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "POST to Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Event as Ignored",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST to Remediation Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond — Remediation Triggered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST to Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond — Alert Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Event as Ignored": {
+      "main": [
+        [
+          {
+            "node": "Respond — Ignored",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Backend — Ignored",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Consensus Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Event Payload": {
+      "main": [
+        [
+          {
+            "node": "Save Event to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Decision Payload": {
+      "main": [
+        [
+          {
+            "node": "Save Decision to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SLA Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Context Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Fetch Agent Weights from DB": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "b9528b60-bfa5-4e94-8d51-b838f4ea3693",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ad165b11320bc91501ab08613cc3a48a62a6caca4d5c8b14ca82cc313b3b96cd"
+  },
+  "id": "nJoIFBLiN1JW1tYB",
+  "tags": [
+    {
+      "updatedAt": "2026-04-02T10:53:57.882Z",
+      "createdAt": "2026-04-02T10:53:57.882Z",
+      "id": "yN6QQJFwif3HRJyA",
+      "name": "autoflow-itops"
+    }
+  ]
+}

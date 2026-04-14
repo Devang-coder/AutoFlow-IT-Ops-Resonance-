@@ -1,0 +1,24 @@
+{
+  "name": "autoflow-backend",
+  "version": "2.0.0",
+  "description": "AutoFlow IT Ops — Node.js API Server",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js"
+  },
+  "keywords": ["autoflow", "itops", "kubernetes", "aiops"],
+  "author": "Heet",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.14.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "pg": "^8.20.0",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
