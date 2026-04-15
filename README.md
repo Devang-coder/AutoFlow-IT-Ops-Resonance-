@@ -6,7 +6,7 @@
 
 **Autonomous Kubernetes Infrastructure Remediation — Detect, Decide, Fix, Learn**
 
-> Submitted for **Resonance 2K26 — Open Innovation Track** | Team: AutoFlow IT Team
+> Submitted for **Resonance 2K26 — Open Innovation Track** | Team: ProductionErrors
 
 ---
 
