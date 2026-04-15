@@ -185,7 +185,7 @@ npm run dev
 1. Open your n8n instance
 2. Import `n8n-workflows/AutoFlow_AI_Workflows_1_2.json`
 3. Configure credentials in n8n:
-   - **PostgreSQL** → Neon DB (host, database, user, password, SSL: require)
+   - **PostgreSQL** → Neon DB (host, database, user, password, SSL: require, USE ACTUAL CREDENTIALS)
    - **Groq API** → HTTP Header Auth with your API key
 4. Activate both workflows
 
